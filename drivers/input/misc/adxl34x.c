@@ -17,6 +17,7 @@
 #include <linux/workqueue.h>
 #include <linux/input/adxl34x.h>
 #include <linux/module.h>
+#include <linux/timer.h>
 
 #include "adxl34x.h"
 
@@ -204,6 +205,7 @@ struct adxl34x {
 	bool suspended;	/* P: mutex */
 	bool fifo_delay;
 	int irq;
+	struct timer_list poll_timer;
 	unsigned model;
 	unsigned int_mask;
 
@@ -434,6 +436,8 @@ void adxl34x_resume(struct adxl34x *ac)
 		__adxl34x_enable(ac);
 
 	ac->suspended = false;
+
+	mod_timer(&ac->poll_timer, jiffies + msecs_to_jiffies(50));
 
 	mutex_unlock(&ac->mutex);
 }
@@ -689,6 +693,17 @@ static void adxl34x_input_close(struct input_dev *input)
 	mutex_unlock(&ac->mutex);
 }
 
+void timer_callback(unsigned long data)
+{
+	struct adxl34x *ac;
+	ac = (struct adxl34x*) data;
+	if(!(ac->suspended || ac->disabled))
+	{
+		mod_timer(&ac->poll_timer, jiffies + msecs_to_jiffies(50));
+		adxl34x_irq(0, data);
+	}
+}
+
 struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 			      bool fifo_delay_default,
 			      const struct adxl34x_bus_ops *bops)
@@ -698,12 +713,6 @@ struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 	const struct adxl34x_platform_data *pdata;
 	int err, range, i;
 	unsigned char revid;
-
-	if (!irq) {
-		dev_err(dev, "no IRQ?\n");
-		err = -ENODEV;
-		goto err_out;
-	}
 
 	ac = kzalloc(sizeof(*ac), GFP_KERNEL);
 	input_dev = input_allocate_device();
@@ -811,12 +820,19 @@ struct adxl34x *adxl34x_probe(struct device *dev, int irq,
 
 	AC_WRITE(ac, POWER_CTL, 0);
 
-	err = request_threaded_irq(ac->irq, NULL, adxl34x_irq,
-				   IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
-				   dev_name(dev), ac);
-	if (err) {
-		dev_err(dev, "irq %d busy?\n", ac->irq);
-		goto err_free_mem;
+	if(ac->irq == 0)
+	{
+		setup_timer(&ac->poll_timer, timer_callback, (unsigned long)ac);
+	}
+	else
+	{
+		err = request_threaded_irq(ac->irq, NULL, adxl34x_irq,
+					   IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+					   dev_name(dev), ac);
+		if (err) {
+			dev_err(dev, "irq %d busy?\n", ac->irq);
+			goto err_free_mem;
+		}
 	}
 
 	err = sysfs_create_group(&dev->kobj, &adxl34x_attr_group);
